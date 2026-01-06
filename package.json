@@ -1,0 +1,27 @@
+{
+  "name": "xray-monorepo",
+  "version": "1.0.0",
+  "description": "X-Ray Decision Observability Monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "build:packages": "npm run build --workspaces --if-present --workspace=packages/*",
+    "build:services": "npm run build --workspaces --if-present --workspace=services/*",
+    "build:apps": "npm run build --workspaces --if-present --workspace=apps/*",
+    "clean": "npm run clean --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}
