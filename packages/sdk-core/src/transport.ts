@@ -9,7 +9,7 @@
  * - Circuit breaker pattern: Could be added for production to avoid hammering down APIs
  */
 
-import { XRDecisionEvent, XRRun, XRStep } from '../../shared-types/src/index.js';
+import { XRDecisionEvent, XRRun, XRStep } from '@xray/shared-types';
 
 export interface TransportConfig {
   apiUrl: string;
@@ -52,7 +52,11 @@ export class HttpTransport {
     }
 
     try {
-      await this.sendWithRetry('/api/events/decisions', events);
+      // Send to /ingest endpoint with type and data
+      await this.sendWithRetry('/ingest', {
+        type: 'decisions',
+        data: events,
+      });
     } catch (error) {
       // Silent failure - SDK must never block application logic
       // Trade-off: We lose observability of SDK failures, but maintain
@@ -65,7 +69,10 @@ export class HttpTransport {
    */
   async sendRun(run: XRRun): Promise<void> {
     try {
-      await this.sendWithRetry('/api/runs', run);
+      await this.sendWithRetry('/ingest', {
+        type: 'run',
+        data: run,
+      });
     } catch (error) {
       // Silent failure
     }
@@ -76,7 +83,10 @@ export class HttpTransport {
    */
   async sendStep(step: XRStep): Promise<void> {
     try {
-      await this.sendWithRetry('/api/steps', step);
+      await this.sendWithRetry('/ingest', {
+        type: 'step',
+        data: step,
+      });
     } catch (error) {
       // Silent failure
     }

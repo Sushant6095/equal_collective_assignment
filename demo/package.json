@@ -1,0 +1,20 @@
+{
+  "name": "@xray/demo",
+  "version": "1.0.0",
+  "description": "Demo pipelines for X-Ray system",
+  "main": "bad-pipeline.js",
+  "scripts": {
+    "bad-pipeline": "ts-node bad-pipeline.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@xray/sdk-core": "*",
+    "@xray/shared-types": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.6",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
+

@@ -1,0 +1,143 @@
+# Docker Compose for X-Ray system
+# Run from infra/ directory: docker-compose up -d
+
+services:
+  # ClickHouse - Analytics database
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: xray-clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native interface (internal only)
+    environment:
+      CLICKHOUSE_DB: xray
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # MinIO - S3-compatible storage
+  minio:
+    image: minio/minio:latest
+    container_name: xray-minio
+    ports:
+      - "9002:9000"  # API (mapped to 9002 to avoid conflict)
+      - "9001:9001"  # Console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Redis - Simple queue/message broker
+  redis:
+    image: redis:7-alpine
+    container_name: xray-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Ingestion API
+  ingestion-api:
+    build:
+      context: ..
+      dockerfile: services/ingestion-api/Dockerfile
+    container_name: xray-ingestion-api
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      QUEUE_TYPE: memory
+      LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Processor Worker
+  processor-worker:
+    build:
+      context: ..
+      dockerfile: services/processor-worker/Dockerfile
+    container_name: xray-processor-worker
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_DATABASE: xray
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: xray-raw
+      MINIO_USE_SSL: "false"
+      QUEUE_TYPE: memory
+      POLL_INTERVAL_MS: 1000
+      BATCH_SIZE: 10
+      LOG_LEVEL: info
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Query API
+  query-api:
+    build:
+      context: ..
+      dockerfile: services/query-api/Dockerfile
+    container_name: xray-query-api
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: 3001
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_DATABASE: xray
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: xray-raw
+      MINIO_USE_SSL: "false"
+      LOG_LEVEL: info
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  clickhouse-data:
+  minio-data:
+  redis-data:
+

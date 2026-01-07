@@ -1,0 +1,18 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "..",
+    "module": "commonjs",
+    "esModuleInterop": true,
+    "baseUrl": ".",
+    "paths": {
+      "@xray/sdk-core": ["../packages/sdk-core/src"],
+      "@xray/shared-types": ["../packages/shared-types/src"]
+    },
+    "skipLibCheck": true
+  },
+  "include": ["**/*.ts", "../packages/**/*.ts"],
+  "exclude": ["node_modules", "dist", "../packages/*/node_modules", "../packages/*/dist"]
+}
+
