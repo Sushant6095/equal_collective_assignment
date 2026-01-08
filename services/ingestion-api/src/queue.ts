@@ -125,32 +125,71 @@ export class InMemoryQueue implements EventQueue {
 }
 
 /**
- * Redis queue implementation (shared queue for ingestion and processor)
+ * RabbitMQ queue implementation (production-ready message broker)
  */
-export class RedisQueue implements EventQueue {
-  private client: any;
-  private decisionEventsKey = 'xray:queue:decisions';
-  private runsKey = 'xray:queue:runs';
-  private stepsKey = 'xray:queue:steps';
+export class RabbitMQQueue implements EventQueue {
+  private connection: any = null;
+  private channel: any = null;
+  private decisionQueue = 'xray.decisions';
+  private runsQueue = 'xray.runs';
+  private stepsQueue = 'xray.steps';
+  private isConnecting = false;
 
-  constructor(redisUrl?: string) {
-    // Lazy import to avoid requiring redis if not used
-    const redis = require('redis');
-    this.client = redis.createClient({
-      url: redisUrl || process.env.REDIS_URL || 'redis://localhost:6379',
-    });
-    this.client.on('error', (err: Error) => {
-      console.error('Redis Client Error', err);
-    });
-    this.client.connect().catch((err: Error) => {
-      console.error('Redis connection error', err);
-    });
+  constructor(amqpUrl?: string) {
+    const url = amqpUrl || process.env.AMQP_URL || 'amqp://localhost:5672';
+    this.connect(url);
+  }
+
+  private async connect(url: string): Promise<void> {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
+    try {
+      const amqp = require('amqplib');
+      this.connection = await amqp.connect(url);
+      this.channel = await this.connection.createChannel();
+
+      // Declare durable queues (survive broker restart)
+      await this.channel.assertQueue(this.decisionQueue, { durable: true });
+      await this.channel.assertQueue(this.runsQueue, { durable: true });
+      await this.channel.assertQueue(this.stepsQueue, { durable: true });
+
+      this.connection.on('error', (err: Error) => {
+        console.error('RabbitMQ connection error', err);
+        this.connection = null;
+        this.channel = null;
+      });
+
+      this.connection.on('close', () => {
+        console.warn('RabbitMQ connection closed, will reconnect');
+        this.connection = null;
+        this.channel = null;
+        this.isConnecting = false;
+      });
+    } catch (error) {
+      console.error('Failed to connect to RabbitMQ', error);
+      this.isConnecting = false;
+    }
+  }
+
+  private async ensureConnected(): Promise<boolean> {
+    if (this.channel) return true;
+    
+    const url = process.env.AMQP_URL || 'amqp://localhost:5672';
+    await this.connect(url);
+    return !!this.channel;
   }
 
   async pushDecisionEvent(event: XRDecisionEvent): Promise<boolean> {
     try {
-      await this.client.lPush(this.decisionEventsKey, JSON.stringify(event));
-      return true;
+      if (!(await this.ensureConnected())) return false;
+
+      const message = Buffer.from(JSON.stringify(event));
+      return this.channel.sendToQueue(
+        this.decisionQueue,
+        message,
+        { persistent: true }
+      );
     } catch (error) {
       return false;
     }
@@ -158,8 +197,14 @@ export class RedisQueue implements EventQueue {
 
   async pushRun(run: XRRun): Promise<boolean> {
     try {
-      await this.client.lPush(this.runsKey, JSON.stringify(run));
-      return true;
+      if (!(await this.ensureConnected())) return false;
+
+      const message = Buffer.from(JSON.stringify(run));
+      return this.channel.sendToQueue(
+        this.runsQueue,
+        message,
+        { persistent: true }
+      );
     } catch (error) {
       return false;
     }
@@ -167,23 +212,27 @@ export class RedisQueue implements EventQueue {
 
   async pushStep(step: XRStep): Promise<boolean> {
     try {
-      await this.client.lPush(this.stepsKey, JSON.stringify(step));
-      return true;
+      if (!(await this.ensureConnected())) return false;
+
+      const message = Buffer.from(JSON.stringify(step));
+      return this.channel.sendToQueue(
+        this.stepsQueue,
+        message,
+        { persistent: true }
+      );
     } catch (error) {
       return false;
     }
   }
 
   async pushDecisionEvents(events: XRDecisionEvent[]): Promise<number> {
-    try {
-      // Push each event individually to maintain order
-      for (const event of events) {
-        await this.client.lPush(this.decisionEventsKey, JSON.stringify(event));
+    let count = 0;
+    for (const event of events) {
+      if (await this.pushDecisionEvent(event)) {
+        count++;
       }
-      return events.length;
-    } catch (error) {
-      return 0;
     }
+    return count;
   }
 }
 
@@ -263,8 +312,8 @@ export function createQueue(): EventQueue {
     return new InMemoryQueue();
   }
 
-  if (queueType === 'redis') {
-    return new RedisQueue();
+  if (queueType === 'rabbitmq') {
+    return new RabbitMQQueue();
   }
 
   if (queueType === 'http') {
@@ -272,11 +321,6 @@ export function createQueue(): EventQueue {
     return new HttpQueue(queueUrl);
   }
 
-  // Future: Add SQS implementation
-  // if (queueType === 'sqs') {
-  //   return new SQSQueue({ ... });
-  // }
-
-  throw new Error(`Unknown queue type: ${queueType}`);
+  throw new Error(`Unknown queue type: ${queueType}. Supported: memory, rabbitmq, http`);
 }
 

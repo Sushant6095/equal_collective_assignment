@@ -15,6 +15,9 @@ export interface QueueMessage {
   type: 'decision' | 'decisions' | 'run' | 'step';
   data: XRDecisionEvent | XRDecisionEvent[] | XRRun | XRStep;
   messageId?: string; // For idempotency tracking
+  // RabbitMQ-specific fields for acknowledgment
+  _deliveryTag?: number;
+  _channel?: any;
 }
 
 /**
@@ -39,6 +42,16 @@ export interface EventQueue {
    * Delete a message after successful processing (acknowledge)
    */
   deleteMessage(messageId: string): Promise<void>;
+
+  /**
+   * Acknowledge a message (for RabbitMQ)
+   */
+  acknowledgeMessage(message: QueueMessage): Promise<void>;
+
+  /**
+   * Negative acknowledge a message (for RabbitMQ, re-queue)
+   */
+  nackMessage(message: QueueMessage): Promise<void>;
 }
 
 /**
@@ -76,6 +89,14 @@ export class InMemoryQueue implements EventQueue {
     // In real SQS, this would delete the message
   }
 
+  async acknowledgeMessage(message: QueueMessage): Promise<void> {
+    // In-memory queue doesn't need acknowledgment
+  }
+
+  async nackMessage(message: QueueMessage): Promise<void> {
+    // In-memory queue doesn't need nack
+  }
+
   /**
    * Check if message was already processed (idempotency)
    */
@@ -85,74 +106,92 @@ export class InMemoryQueue implements EventQueue {
 }
 
 /**
- * Redis queue implementation (shared queue for ingestion and processor)
+ * RabbitMQ queue implementation (production-ready message broker)
  */
-export class RedisQueue implements EventQueue {
-  private client: any;
-  private decisionEventsKey = 'xray:queue:decisions';
-  private runsKey = 'xray:queue:runs';
-  private stepsKey = 'xray:queue:steps';
+export class RabbitMQQueue implements EventQueue {
+  private connection: any = null;
+  private channel: any = null;
+  private decisionQueue = 'xray.decisions';
+  private runsQueue = 'xray.runs';
+  private stepsQueue = 'xray.steps';
+  private isConnecting = false;
 
-  constructor(redisUrl?: string) {
-    // Lazy import to avoid requiring redis if not used
-    const redis = require('redis');
-    this.client = redis.createClient({
-      url: redisUrl || process.env.REDIS_URL || 'redis://localhost:6379',
-    });
-    this.client.on('error', (err: Error) => {
-      console.error('Redis Client Error', err);
-    });
-    this.client.connect().catch((err: Error) => {
-      console.error('Redis connection error', err);
-    });
+  constructor(amqpUrl?: string) {
+    const url = amqpUrl || process.env.AMQP_URL || 'amqp://localhost:5672';
+    this.connect(url);
+  }
+
+  private async connect(url: string): Promise<void> {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
+    try {
+      const amqp = require('amqplib');
+      this.connection = await amqp.connect(url);
+      this.channel = await this.connection.createChannel();
+
+      // Declare durable queues
+      await this.channel.assertQueue(this.decisionQueue, { durable: true });
+      await this.channel.assertQueue(this.runsQueue, { durable: true });
+      await this.channel.assertQueue(this.stepsQueue, { durable: true });
+
+      // Set prefetch (how many unacked messages per consumer)
+      await this.channel.prefetch(10);
+
+      this.connection.on('error', (err: Error) => {
+        console.error('RabbitMQ connection error', err);
+        this.connection = null;
+        this.channel = null;
+        this.isConnecting = false;
+      });
+
+      this.connection.on('close', () => {
+        console.warn('RabbitMQ connection closed, will reconnect');
+        this.connection = null;
+        this.channel = null;
+        this.isConnecting = false;
+      });
+    } catch (error) {
+      console.error('Failed to connect to RabbitMQ', error);
+      this.isConnecting = false;
+    }
+  }
+
+  private async ensureConnected(): Promise<boolean> {
+    if (this.channel) return true;
+    
+    const url = process.env.AMQP_URL || 'amqp://localhost:5672';
+    await this.connect(url);
+    return !!this.channel;
   }
 
   async poll(maxMessages: number = 10): Promise<QueueMessage[]> {
     try {
+      if (!(await this.ensureConnected())) return [];
+
       const messages: QueueMessage[] = [];
-      
-      // Poll from all three queues (priority: decisions > steps > runs)
-      // Use rPop to get one message at a time
-      while (messages.length < maxMessages) {
-        // Try decisions first
-        const decisionData = await this.client.rPop(this.decisionEventsKey);
-        if (decisionData) {
-          const event = typeof decisionData === 'string' ? JSON.parse(decisionData) : decisionData;
-          messages.push({
-            type: 'decision',
-            data: event,
-            messageId: `decision-${event.id || Date.now()}-${Math.random()}`,
-          });
-          if (messages.length >= maxMessages) break;
-        }
+      const queues = [
+        { name: this.decisionQueue, type: 'decision' as const },
+        { name: this.stepsQueue, type: 'step' as const },
+        { name: this.runsQueue, type: 'run' as const },
+      ];
 
-        // Try steps
-        const stepData = await this.client.rPop(this.stepsKey);
-        if (stepData) {
-          const step = typeof stepData === 'string' ? JSON.parse(stepData) : stepData;
-          messages.push({
-            type: 'step',
-            data: step,
-            messageId: `step-${step.id || Date.now()}-${Math.random()}`,
-          });
-          if (messages.length >= maxMessages) break;
-        }
+      // Poll from all queues (priority: decisions > steps > runs)
+      for (const queue of queues) {
+        if (messages.length >= maxMessages) break;
 
-        // Try runs
-        const runData = await this.client.rPop(this.runsKey);
-        if (runData) {
-          const run = typeof runData === 'string' ? JSON.parse(runData) : runData;
+        // Get message (non-blocking, noAck: false means we need to ack manually)
+        const msg = await this.channel.get(queue.name, { noAck: false });
+        
+        if (msg && msg.fields && msg.fields.deliveryTag !== undefined) {
+          const data = JSON.parse(msg.content.toString());
           messages.push({
-            type: 'run',
-            data: run,
-            messageId: `run-${run.id || Date.now()}-${Math.random()}`,
+            type: queue.type,
+            data: data,
+            messageId: msg.properties?.messageId || `${queue.type}-${data.id || Date.now()}`,
+            _deliveryTag: msg.fields.deliveryTag,
+            _channel: this.channel,
           });
-          if (messages.length >= maxMessages) break;
-        }
-
-        // If no messages found, break
-        if (!decisionData && !stepData && !runData) {
-          break;
         }
       }
 
@@ -163,8 +202,27 @@ export class RedisQueue implements EventQueue {
   }
 
   async deleteMessage(messageId: string): Promise<void> {
-    // Redis rPop already removes the message, so nothing to do here
-    // This is for idempotency tracking if needed
+    // For RabbitMQ, acknowledgment is handled via acknowledgeMessage
+  }
+
+  async acknowledgeMessage(message: QueueMessage): Promise<void> {
+    try {
+      if (message._deliveryTag !== undefined && this.channel) {
+        this.channel.ack(message._deliveryTag);
+      }
+    } catch (error) {
+      // Silent failure - message might already be acked
+    }
+  }
+
+  async nackMessage(message: QueueMessage): Promise<void> {
+    try {
+      if (message._deliveryTag !== undefined && this.channel) {
+        this.channel.nack(message._deliveryTag, false, true);
+      }
+    } catch (error) {
+      // Silent failure
+    }
   }
 }
 
@@ -208,6 +266,17 @@ export class HttpQueue implements EventQueue {
       // Silent failure
     }
   }
+
+  async acknowledgeMessage(message: QueueMessage): Promise<void> {
+    // HTTP queue handles acknowledgment via deleteMessage
+    if (message.messageId) {
+      await this.deleteMessage(message.messageId);
+    }
+  }
+
+  async nackMessage(message: QueueMessage): Promise<void> {
+    // HTTP queue doesn't support nack
+  }
 }
 
 /**
@@ -220,8 +289,8 @@ export function createQueue(): EventQueue {
     return new InMemoryQueue();
   }
 
-  if (queueType === 'redis') {
-    return new RedisQueue();
+  if (queueType === 'rabbitmq') {
+    return new RabbitMQQueue();
   }
 
   if (queueType === 'http') {
@@ -229,11 +298,6 @@ export function createQueue(): EventQueue {
     return new HttpQueue(queueUrl);
   }
 
-  // Future: Add SQS implementation
-  // if (queueType === 'sqs') {
-  //   return new SQSQueue({ ... });
-  // }
-
-  throw new Error(`Unknown queue type: ${queueType}`);
+  throw new Error(`Unknown queue type: ${queueType}. Supported: memory, rabbitmq, http`);
 }
 
