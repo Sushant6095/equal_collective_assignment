@@ -15,6 +15,7 @@ export interface S3Config {
   secretKey: string;
   bucket: string;
   useSSL: boolean;
+  region?: string; // For AWS S3, GCS, etc.
 }
 
 /**
@@ -35,6 +36,7 @@ export class S3Client {
       useSSL: config.useSSL,
       accessKey: config.accessKey,
       secretKey: config.secretKey,
+      region: config.region, // For AWS S3 and other cloud providers
     });
   }
 

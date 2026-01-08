@@ -16,6 +16,7 @@ async function main() {
   logger.info('Starting processor worker...');
 
   // Initialize ClickHouse
+  // Pass empty string - the ClickHouseStorage constructor will handle it properly
   const clickhouse = new ClickHouseStorage({
     host: process.env.CLICKHOUSE_HOST || 'localhost',
     port: parseInt(process.env.CLICKHOUSE_PORT || '8123', 10),
@@ -35,6 +36,7 @@ async function main() {
     secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin',
     bucket: process.env.MINIO_BUCKET || 'xray-raw',
     useSSL: process.env.MINIO_USE_SSL === 'true',
+    region: process.env.MINIO_REGION, // Optional: for AWS S3, GCS, etc.
   });
 
   await s3.initialize();

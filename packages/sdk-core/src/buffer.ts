@@ -9,7 +9,7 @@
  * - Loss tolerance: If buffer is full, we drop oldest events (FIFO) rather than blocking
  */
 
-import { XRDecisionEvent } from '../../shared-types/src/index.js';
+import { XRDecisionEvent } from '@xray/shared-types';
 
 export interface BufferConfig {
   maxSize: number; // Maximum events before forced flush

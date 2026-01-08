@@ -21,6 +21,7 @@ export enum XRStepType {
   RANK = 'rank',
   LLM = 'llm',
   TRANSFORM = 'transform',
+  SCORE = 'score',
 }
 
 /**

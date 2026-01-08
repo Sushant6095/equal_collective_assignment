@@ -16,6 +16,7 @@ export interface S3Config {
   secretKey: string;
   bucket: string;
   useSSL: boolean;
+  region?: string; // For AWS S3, GCS, etc.
 }
 
 /**
@@ -39,6 +40,7 @@ export class S3Storage {
       useSSL: config.useSSL,
       accessKey: config.accessKey,
       secretKey: config.secretKey,
+      region: config.region, // For AWS S3 and other cloud providers
     });
   }
 
@@ -50,7 +52,9 @@ export class S3Storage {
   async initialize(): Promise<void> {
     const exists = await this.client.bucketExists(this.bucketName);
     if (!exists) {
-      await this.client.makeBucket(this.bucketName, 'us-east-1');
+      // Use provided region or default to us-east-1
+      const region = (this.client as any).region || 'us-east-1';
+      await this.client.makeBucket(this.bucketName, region);
     }
   }
 

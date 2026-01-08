@@ -58,12 +58,28 @@ export class ClickHouseStorage {
 
   constructor(config: ClickHouseConfig) {
     this.database = config.database;
-    this.client = createClient({
+    
+    // Build connection config - completely omit password if empty
+    // ClickHouse client has issues with empty string passwords
+    const clientConfig: {
+      host: string;
+      username: string;
+      database: string;
+      password?: string;
+    } = {
       host: `http://${config.host}:${config.port}`,
       username: config.user,
-      password: config.password,
       database: this.database,
-    });
+    };
+    
+    // Only add password property if it's actually provided and not empty
+    // Omitting the field entirely works better than empty string
+    const password = config.password?.trim();
+    if (password && password.length > 0) {
+      clientConfig.password = password;
+    }
+    
+    this.client = createClient(clientConfig);
   }
 
   /**

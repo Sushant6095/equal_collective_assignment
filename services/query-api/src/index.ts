@@ -37,6 +37,7 @@ async function main() {
     secretKey: process.env.MINIO_SECRET_KEY || 'minioadmin',
     bucket: process.env.MINIO_BUCKET || 'xray-raw',
     useSSL: process.env.MINIO_USE_SSL === 'true',
+    region: process.env.MINIO_REGION, // Optional: for AWS S3, GCS, etc.
   });
   logger.info('S3/MinIO initialized');
 

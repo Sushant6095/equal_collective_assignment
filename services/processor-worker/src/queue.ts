@@ -85,6 +85,90 @@ export class InMemoryQueue implements EventQueue {
 }
 
 /**
+ * Redis queue implementation (shared queue for ingestion and processor)
+ */
+export class RedisQueue implements EventQueue {
+  private client: any;
+  private decisionEventsKey = 'xray:queue:decisions';
+  private runsKey = 'xray:queue:runs';
+  private stepsKey = 'xray:queue:steps';
+
+  constructor(redisUrl?: string) {
+    // Lazy import to avoid requiring redis if not used
+    const redis = require('redis');
+    this.client = redis.createClient({
+      url: redisUrl || process.env.REDIS_URL || 'redis://localhost:6379',
+    });
+    this.client.on('error', (err: Error) => {
+      console.error('Redis Client Error', err);
+    });
+    this.client.connect().catch((err: Error) => {
+      console.error('Redis connection error', err);
+    });
+  }
+
+  async poll(maxMessages: number = 10): Promise<QueueMessage[]> {
+    try {
+      const messages: QueueMessage[] = [];
+      
+      // Poll from all three queues (priority: decisions > steps > runs)
+      // Use rPop to get one message at a time
+      while (messages.length < maxMessages) {
+        // Try decisions first
+        const decisionData = await this.client.rPop(this.decisionEventsKey);
+        if (decisionData) {
+          const event = typeof decisionData === 'string' ? JSON.parse(decisionData) : decisionData;
+          messages.push({
+            type: 'decision',
+            data: event,
+            messageId: `decision-${event.id || Date.now()}-${Math.random()}`,
+          });
+          if (messages.length >= maxMessages) break;
+        }
+
+        // Try steps
+        const stepData = await this.client.rPop(this.stepsKey);
+        if (stepData) {
+          const step = typeof stepData === 'string' ? JSON.parse(stepData) : stepData;
+          messages.push({
+            type: 'step',
+            data: step,
+            messageId: `step-${step.id || Date.now()}-${Math.random()}`,
+          });
+          if (messages.length >= maxMessages) break;
+        }
+
+        // Try runs
+        const runData = await this.client.rPop(this.runsKey);
+        if (runData) {
+          const run = typeof runData === 'string' ? JSON.parse(runData) : runData;
+          messages.push({
+            type: 'run',
+            data: run,
+            messageId: `run-${run.id || Date.now()}-${Math.random()}`,
+          });
+          if (messages.length >= maxMessages) break;
+        }
+
+        // If no messages found, break
+        if (!decisionData && !stepData && !runData) {
+          break;
+        }
+      }
+
+      return messages;
+    } catch (error) {
+      return [];
+    }
+  }
+
+  async deleteMessage(messageId: string): Promise<void> {
+    // Redis rPop already removes the message, so nothing to do here
+    // This is for idempotency tracking if needed
+  }
+}
+
+/**
  * HTTP queue implementation (for local development with queue-service)
  */
 export class HttpQueue implements EventQueue {
@@ -134,6 +218,10 @@ export function createQueue(): EventQueue {
 
   if (queueType === 'memory') {
     return new InMemoryQueue();
+  }
+
+  if (queueType === 'redis') {
+    return new RedisQueue();
   }
 
   if (queueType === 'http') {

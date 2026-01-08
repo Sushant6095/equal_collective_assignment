@@ -6,6 +6,7 @@
  * - Automatic metrics: Captures input/output counts without requiring explicit calls
  * - Adaptive sampling: Reduces data volume while maintaining observability
  * - Silent failures: SDK failures never affect application execution
+ * - Lightweight wrapper: Works with existing code without requiring refactoring
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -32,15 +33,37 @@ export interface XRayConfig {
 }
 
 /**
+ * Decision callback for custom decision reporting
+ * Allows developers to optionally provide decision context
+ */
+export interface DecisionCallback<TInput, TOutput> {
+  (item: TInput, result: TOutput, index: number): {
+    outcome: XRDecisionOutcome;
+    reason: string;
+    score?: number;
+  } | null; // Return null to skip tracking this item
+}
+
+/**
  * X-Ray SDK for tracking decisions in multi-step pipelines
  * 
- * Usage:
+ * Usage (Lightweight - works with existing code):
  *   const xray = new XRay({ apiUrl: 'http://localhost:3000' });
  *   const runId = await xray.startRun('pipeline-1', input);
- *   const result = await xray.step(runId, XRStepType.FILTER, 'filter-step', async () => {
- *     // business logic
- *     return processedItems;
- *   });
+ *   
+ *   // Simple wrapper - no code changes needed
+ *   const result = await xray.step(
+ *     runId,
+ *     XRStepType.FILTER,
+ *     'filter-step',
+ *     async (input) => {
+ *       // Your existing business logic - no changes needed!
+ *       return input.filter(item => item.score > 0.5);
+ *     },
+ *     inputData,
+ *     { threshold: 0.5 }
+ *   );
+ *   
  *   await xray.endRun(runId, result);
  */
 export class XRay {
@@ -102,46 +125,59 @@ export class XRay {
   /**
    * Execute a step and automatically capture decisions
    * 
-   * This method wraps business logic execution and automatically:
+   * LIGHTWEIGHT WRAPPER: Works with existing code without requiring refactoring.
+   * 
+   * This method automatically:
    * - Tracks input/output counts
+   * - Detects which items were kept/eliminated/scored by comparing input vs output
    * - Captures decision events based on capture level
    * - Samples events if needed
    * - Buffers events for batch sending
    * 
-   * Trade-off: We require the business logic to return an array of items
-   * with decision metadata. This is a design constraint that ensures we can
-   * track individual item decisions. Alternative: Could accept a callback that
-   * explicitly reports decisions, but that's more verbose.
-   * 
    * @param runId - The run this step belongs to
    * @param stepType - Type of step (filter, rank, llm, transform)
    * @param stepName - Human-readable step name
-   * @param businessLogic - Async function that executes the step logic and returns items with decisions
+   * @param businessLogic - Your existing business logic function (no changes needed!)
    * @param input - Input to the business logic
-   * @param config - Optional step configuration
+   * @param config - Optional step configuration (filters applied, thresholds, etc.)
+   * @param decisionCallback - Optional callback for custom decision reporting
    * @returns The result of businessLogic execution
    */
-  async step<TInput, TOutput extends Array<{
-    itemId: string;
-    outcome: XRDecisionOutcome;
-    input: unknown;
-    output: unknown;
-    reason: string;
-    score?: number;
-  }>>(
+  async step<TInput extends Array<any>, TOutput extends Array<any>>(
     runId: string,
     stepType: XRStepType,
     stepName: string,
     businessLogic: (input: TInput) => Promise<TOutput>,
     input: TInput,
-    config?: Record<string, unknown>
+    config?: Record<string, unknown>,
+    decisionCallback?: DecisionCallback<TInput[number], TOutput[number]>
+  ): Promise<TOutput>;
+
+  async step<TInput, TOutput>(
+    runId: string,
+    stepType: XRStepType,
+    stepName: string,
+    businessLogic: (input: TInput) => Promise<TOutput>,
+    input: TInput,
+    config?: Record<string, unknown>,
+    decisionCallback?: DecisionCallback<TInput, TOutput>
+  ): Promise<TOutput>;
+
+  async step<TInput, TOutput>(
+    runId: string,
+    stepType: XRStepType,
+    stepName: string,
+    businessLogic: (input: TInput) => Promise<TOutput>,
+    input: TInput,
+    config?: Record<string, unknown>,
+    decisionCallback?: DecisionCallback<any, any>
   ): Promise<TOutput> {
     const stepId = uuidv4();
     const step: XRStep = {
       id: stepId,
       type: stepType,
       name: stepName,
-      config,
+      config, // Captures filters applied, thresholds, etc.
       startedAt: new Date(),
       completedAt: null,
     };
@@ -154,13 +190,11 @@ export class XRay {
     });
 
     try {
-      // Execute business logic
-      // Trade-off: We execute synchronously here, but all observability
-      // operations (buffering, transport) are async and non-blocking.
+      // Execute business logic (your existing code - no changes!)
       const output = await businessLogic(input);
 
       // Automatically capture metrics and decisions
-      this.captureStepMetrics(runId, stepId, input, output);
+      this.captureStepMetrics(runId, stepId, input, output, stepType, config, decisionCallback);
 
       // Mark step as completed
       step.completedAt = new Date();
@@ -185,70 +219,179 @@ export class XRay {
   }
 
   /**
-   * Capture step metrics and decision events
+   * Capture step metrics and decision events automatically
    * 
-   * Trade-off: We infer decisions from the output array structure.
-   * This requires the business logic to return items with decision metadata.
-   * Alternative: Pass a separate decisions array, but that's more verbose.
+   * AUTOMATIC CAPTURE: Detects decisions by comparing input vs output.
+   * No manual decision object construction required.
    */
-  private captureStepMetrics(
+  private captureStepMetrics<TInput, TOutput>(
     runId: string,
     stepId: string,
-    input: unknown,
-    output: Array<{
-      itemId: string;
-      outcome: XRDecisionOutcome;
-      input: unknown;
-      output: unknown;
-      reason: string;
-      score?: number;
-    }>
+    input: TInput,
+    output: TOutput,
+    stepType: XRStepType,
+    config?: Record<string, unknown>,
+    decisionCallback?: DecisionCallback<any, any>
   ): void {
-    // Always capture input/output counts (even in metrics_only mode)
+    // Always capture input/output counts
     const inputCount = Array.isArray(input) ? input.length : 1;
-    const outputCount = output.length;
+    const outputCount = Array.isArray(output) ? output.length : 1;
 
     // Determine what to capture based on capture level
     if (this.captureLevel === CaptureLevel.METRICS_ONLY) {
       // Only send metrics, no decision events
-      // Trade-off: We could send a single "step metrics" event here,
-      // but for simplicity, we rely on step metadata for metrics.
       return;
     }
 
     // For SAMPLED and FULL, capture decision events
     const shouldSample = this.captureLevel === CaptureLevel.SAMPLED;
-    const targetSampleSize = shouldSample
-      ? this.sampler.calculateTargetSampleSize(outputCount)
-      : outputCount;
 
-    // Capture decision events
-    output.forEach((item, index) => {
-      const shouldCapture = !shouldSample || this.sampler.shouldSample(index, outputCount, targetSampleSize);
+    // Automatic decision detection for array inputs/outputs
+    if (Array.isArray(input) && Array.isArray(output)) {
+      // Create a map of output items by ID for fast lookup
+      const outputMap = new Map();
+      const outputById = new Map();
+      
+      // Try to identify items by common ID fields
+      output.forEach((item, index) => {
+        if (item && typeof item === 'object') {
+          const id = (item as any).id || (item as any).itemId || (item as any).key || `item-${index}`;
+          outputMap.set(id, item);
+          outputById.set(id, index);
+        }
+      });
 
-      if (shouldCapture) {
+      // Process each input item
+      input.forEach((inputItem, inputIndex) => {
+        let itemId: string;
+        let outputItem: any = null;
+        let outcome: XRDecisionOutcome;
+        let reason: string;
+        let score: number | undefined;
+
+        // Try to get item ID from common fields
+        if (inputItem && typeof inputItem === 'object') {
+          itemId = (inputItem as any).id || (inputItem as any).itemId || (inputItem as any).key || `item-${inputIndex}`;
+          
+          // Check if item exists in output
+          outputItem = outputMap.get(itemId);
+          
+          // If not found by ID, try to find by reference equality
+          if (!outputItem) {
+            const outputIndex = output.findIndex(item => item === inputItem);
+            if (outputIndex >= 0) {
+              outputItem = output[outputIndex];
+            }
+          }
+        } else {
+          itemId = `item-${inputIndex}`;
+          // For primitive types, check if value exists in output
+          outputItem = output.includes(inputItem) ? inputItem : null;
+        }
+
+        // Use custom callback if provided
+        if (decisionCallback) {
+          const decision = decisionCallback(inputItem, outputItem, inputIndex);
+          if (decision) {
+            outcome = decision.outcome;
+            reason = decision.reason;
+            score = decision.score;
+          } else {
+            // Callback returned null, skip this item
+            return;
+          }
+        } else {
+          // Automatic decision detection
+          if (outputItem !== null && outputItem !== undefined) {
+            // Item was kept or modified
+            if (stepType === XRStepType.RANK || stepType === XRStepType.SCORE) {
+              outcome = XRDecisionOutcome.SCORED;
+              score = (outputItem as any)?.score || (outputItem as any)?.relevanceScore;
+              reason = `Item scored: ${score !== undefined ? score : 'N/A'}`;
+            } else {
+              outcome = XRDecisionOutcome.KEPT;
+              reason = `Item passed ${stepType} step`;
+            }
+          } else {
+            // Item was eliminated
+            outcome = XRDecisionOutcome.ELIMINATED;
+            reason = `Item eliminated by ${stepType} step`;
+            
+            // Try to extract reason from config
+            if (config) {
+              if (config.threshold && (inputItem as any)?.score !== undefined) {
+                reason = `Score ${(inputItem as any).score} below threshold ${config.threshold}`;
+              } else if (config.matchType) {
+                reason = `Item did not match ${config.matchType} criteria`;
+              }
+            }
+          }
+        }
+
+        // Determine if we should capture this event
+        const shouldCapture = !shouldSample || this.sampler.shouldSample(
+          inputIndex,
+          inputCount,
+          this.sampler.calculateTargetSampleSize(inputCount)
+        );
+
+        if (shouldCapture) {
+          const event: XRDecisionEvent = {
+            id: uuidv4(),
+            stepId,
+            runId,
+            outcome,
+            itemId,
+            input: inputItem,
+            output: outputItem,
+            reason,
+            score,
+            metadata: {
+              inputCount,
+              outputCount,
+              sampled: shouldSample && inputIndex > 0 && inputIndex < inputCount - 1,
+              stepType,
+              filtersApplied: config, // Automatically captures filters applied
+            },
+            timestamp: new Date(),
+          };
+
+          // Add to buffer (non-blocking)
+          this.buffer.add(event);
+        }
+      });
+    } else {
+      // For non-array inputs/outputs, create a single decision event
+      const itemId = 'single-item';
+      const outcome = output !== null && output !== undefined 
+        ? XRDecisionOutcome.KEPT 
+        : XRDecisionOutcome.ELIMINATED;
+      const reason = outcome === XRDecisionOutcome.KEPT
+        ? `Step completed successfully`
+        : `Step eliminated item`;
+
+      if (!shouldSample || this.sampler.shouldSample(0, 1, 1)) {
         const event: XRDecisionEvent = {
           id: uuidv4(),
           stepId,
           runId,
-          outcome: item.outcome,
-          itemId: item.itemId,
-          input: item.input,
-          output: item.output,
-          reason: item.reason,
-          score: item.score,
+          outcome,
+          itemId,
+          input,
+          output,
+          reason,
           metadata: {
             inputCount,
             outputCount,
-            sampled: shouldSample && index > 0 && index < outputCount - 1,
+            stepType,
+            filtersApplied: config,
           },
           timestamp: new Date(),
         };
 
-        // Add to buffer (non-blocking)
         this.buffer.add(event);
       }
-    });
+    }
   }
 
   /**
@@ -294,4 +437,3 @@ export class XRay {
     return this.buffer.getSize();
   }
 }
-

@@ -5,6 +5,8 @@
   "main": "bad-pipeline.js",
   "scripts": {
     "bad-pipeline": "ts-node bad-pipeline.ts",
+    "real-world-test": "ts-node real-world-test.ts",
+    "test": "ts-node real-world-test.ts",
     "build": "tsc"
   },
   "dependencies": {
