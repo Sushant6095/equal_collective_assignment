@@ -47,8 +47,8 @@ Imagine you have a competitor selection pipeline that filters candidates through
         │                               │
         ▼                               ▼
 ┌───────────────┐            ┌──────────────────┐
-│  ClickHouse   │            │   MinIO (S3)     │
-│  (Metrics)    │            │  (Raw Payloads)  │
+│  ClickHouse   │            │   AWS S3          │
+│  (Metrics)    │            │  (Raw Payloads)   │
 │               │            │                  │
 │ - Runs        │            │ - Full events    │
 │ - Steps       │            │ - Full payloads  │
@@ -167,13 +167,32 @@ Dashboard → Query API → ClickHouse/S3 → Beautiful UI
   - Stores aggregated metrics (runs, steps, decision references)
   - Partitioned by month for performance
   - ReplacingMergeTree engine for idempotent inserts
-- **MinIO (S3-compatible)** - Object storage for raw payloads
+- **AWS S3** - Object storage for raw payloads
   - Deterministic keys: `decisions/{year}/{month}/{day}/{eventId}.json`
-  - Cheap storage, fetched only when debugging
+  - Date-based partitioning for efficient queries
+  - Idempotent storage (safe retries)
+  - **Why S3?**
+    - **Cost-effective**: Extremely cheap storage for large volumes of raw data
+    - **Scalability**: Unlimited storage capacity without performance degradation
+    - **Durability**: 99.999999999% (11 9's) durability guarantee
+    - **Separation of concerns**: ClickHouse for fast queries, S3 for detailed payloads
+    - **On-demand access**: Full payloads only fetched when debugging specific issues
+    - **Deterministic keys**: Same event always goes to same location, enabling idempotent writes
 
 ### Message Queue
-- **Redis** - Queue backend (or in-memory for local dev)
-- **Simple polling** - Worker polls queue every second
+- **RabbitMQ** - Production-ready message broker
+  - Durable queues that survive broker restarts
+  - Automatic reconnection and error handling
+  - Message acknowledgment for reliable processing
+  - Supports multiple queue types (decisions, runs, steps)
+  - Management UI available on port 15672
+- **Why RabbitMQ?** 
+  - **Reliability**: Durable queues ensure no message loss on broker restart
+  - **Scalability**: Handles high throughput with multiple consumers
+  - **Production-ready**: Battle-tested message broker with robust error handling
+  - **Decoupling**: Completely decouples ingestion from processing, allowing independent scaling
+  - **Message acknowledgment**: Ensures messages are only removed after successful processing
+- **Fallback options**: In-memory queue for local dev, HTTP queue for custom implementations
 
 ### Infrastructure
 - **Docker Compose** - Local development
@@ -258,10 +277,16 @@ docker-compose up -d
 
 This starts:
 - ClickHouse (port 8123)
-- MinIO (ports 9001, 9002)
-- Redis (port 6379)
+- RabbitMQ (ports 5672, 15672)
 - Ingestion API (port 3000)
 - Query API (port 3001)
+- Processor Worker
+
+**Note:** AWS S3 credentials must be configured via environment variables:
+- `AWS_REGION` (default: us-east-1)
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+- `AWS_S3_BUCKET` (default: xray-raw)
 - Processor Worker
 
 ### 2. Run Demo Pipeline
@@ -300,6 +325,81 @@ Open http://localhost:3000/runs and explore the runs, steps, and decisions.
 **Step 5:** Track item through all steps using `getDecisionEventsByItemId()` to see where it incorrectly passed through.
 
 **Result:** Fixed the bug in 2 minutes instead of spending hours tracing through logs.
+
+## 🔄 Architecture Evolution: Why RabbitMQ and S3?
+
+### Migration from In-Memory/Redis to RabbitMQ
+
+**Previous Architecture:**
+- In-memory queue for MVP (simple but limited)
+- Redis as alternative (better but still had limitations)
+
+**Why We Moved to RabbitMQ:**
+
+1. **Durability & Reliability**
+   - In-memory queues lose all messages on restart
+   - RabbitMQ's durable queues persist messages to disk, surviving broker restarts
+   - Critical for production systems where data loss is unacceptable
+
+2. **Message Acknowledgment**
+   - RabbitMQ's ack/nack mechanism ensures messages are only removed after successful processing
+   - Failed processing can automatically re-queue messages for retry
+   - Prevents message loss during worker crashes or errors
+
+3. **Production Scalability**
+   - Supports multiple consumers for horizontal scaling
+   - Prefetch mechanism controls message flow to prevent worker overload
+   - Better handling of traffic spikes and bursts
+
+4. **Operational Excellence**
+   - Management UI for monitoring queue health and message flow
+   - Built-in connection recovery and error handling
+   - Industry-standard message broker with extensive tooling
+
+5. **Decoupling**
+   - Complete separation between ingestion and processing
+   - Services can be scaled independently
+   - No shared memory or tight coupling between components
+
+### Migration to S3 for Raw Payload Storage
+
+**Previous Approach:**
+- Storing full payloads directly in ClickHouse
+- High storage costs and slower query performance
+
+**Why We Moved to S3:**
+
+1. **Cost Optimization**
+   - ClickHouse storage is expensive for large JSON payloads
+   - S3 provides extremely cheap storage ($0.023/GB/month)
+   - Significant cost savings as data volume grows
+
+2. **Performance Separation**
+   - ClickHouse optimized for fast analytical queries on metrics
+   - S3 optimized for cheap storage of large objects
+   - Queries remain fast by only fetching full payloads when needed
+
+3. **Unlimited Scalability**
+   - ClickHouse has practical limits on table size and query performance
+   - S3 scales infinitely without performance degradation
+   - Can store years of historical data without impacting query speed
+
+4. **Dual Storage Strategy**
+   - **ClickHouse**: Fast queries on aggregated metrics (runs, steps, elimination ratios)
+   - **S3**: Full payloads with complete context (only fetched during debugging)
+   - Best of both worlds: speed for common queries, detail when needed
+
+5. **Idempotent Storage**
+   - Deterministic S3 keys based on event ID and date
+   - Same event always goes to same location
+   - Safe retries without duplicate storage
+
+6. **Data Lifecycle Management**
+   - Easy to implement retention policies (delete old S3 objects)
+   - Can archive to Glacier for even cheaper long-term storage
+   - ClickHouse can be kept lean with only recent metrics
+
+**Result:** A production-ready architecture that scales cost-effectively while maintaining fast query performance and complete data traceability.
 
 ## 🎓 How It's Different From Tracing
 

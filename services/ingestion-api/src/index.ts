@@ -5,6 +5,14 @@
  * Stateless design: No database writes, all state in queue.
  */
 
+// Load environment variables from root .env file
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Resolve root .env path (works in both dev and production)
+const rootEnvPath = path.resolve(__dirname, '../../../.env');
+dotenv.config({ path: rootEnvPath });
+
 import express from 'express';
 import { createServer } from 'http';
 import * as net from 'net';

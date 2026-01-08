@@ -1,12 +1,5 @@
 /**
- * Async buffer for batching decision events
- * 
- * Design trade-offs:
- * - Non-blocking: All operations are fire-and-forget to never block application logic
- * - Batching: Events are batched to reduce HTTP overhead
- * - Size-based flushing: Flush when buffer reaches max size
- * - Time-based flushing: Flush periodically even if buffer isn't full (prevents stale data)
- * - Loss tolerance: If buffer is full, we drop oldest events (FIFO) rather than blocking
+ * Async buffer for batching events. Non-blocking, drops oldest if full.
  */
 
 import { XRDecisionEvent } from '@xray/shared-types';
@@ -24,10 +17,7 @@ const DEFAULT_CONFIG: BufferConfig = {
 };
 
 /**
- * Non-blocking buffer that batches events and sends them asynchronously
- * 
- * Trade-off: We use a simple array-based buffer. For high-throughput scenarios,
- * consider a ring buffer or queue data structure to avoid array resizing overhead.
+ * Batches events and sends them async. Simple array buffer for now.
  */
 export class EventBuffer {
   private buffer: XRDecisionEvent[] = [];
@@ -45,16 +35,10 @@ export class EventBuffer {
   }
 
   /**
-   * Add an event to the buffer (non-blocking)
-   * 
-   * Trade-off: We don't await the flush to avoid blocking.
-   * This means events might be lost if the process crashes before flush.
-   * For critical events, consider a synchronous flush option.
+   * Add event to buffer. Non-blocking - might lose events on crash.
    */
   add(event: XRDecisionEvent): void {
-    // If buffer is full, drop oldest event (FIFO)
-    // Trade-off: Dropping is better than blocking, but we lose data.
-    // Alternative: Could use backpressure or blocking, but violates "never block" requirement.
+    // Drop oldest if buffer is full (better than blocking)
     if (this.buffer.length >= DEFAULT_CONFIG.maxSize) {
       this.buffer.shift(); // Remove oldest
     }
@@ -71,11 +55,7 @@ export class EventBuffer {
   }
 
   /**
-   * Flush all buffered events
-   * 
-   * Trade-off: We prevent concurrent flushes to avoid race conditions,
-   * but this means if a flush is slow, new events will accumulate.
-   * For high-throughput, consider multiple buffers or worker threads.
+   * Flush all buffered events. Prevents concurrent flushes.
    */
   private async flush(): Promise<void> {
     if (this.isFlushing || this.buffer.length === 0) {
@@ -89,9 +69,7 @@ export class EventBuffer {
     try {
       await this.flushCallback(eventsToSend);
     } catch (error) {
-      // If flush fails, we could re-add events, but that risks infinite loops.
-      // Instead, we drop them and rely on application-level retries if needed.
-      // Trade-off: Data loss vs. memory/retry complexity
+      // Drop events if flush fails (avoid infinite retry loops)
       console.warn('[XRay] Failed to flush events, dropping batch:', error);
     } finally {
       this.isFlushing = false;

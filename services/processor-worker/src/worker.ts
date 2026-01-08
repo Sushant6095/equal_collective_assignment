@@ -142,8 +142,14 @@ export class ProcessorWorker {
         await this.processMessage(message);
 
         // Acknowledge message after successful processing
-        if (message.messageId) {
-          await this.queue.deleteMessage(message.messageId);
+        try {
+          await this.queue.acknowledgeMessage(message);
+        } catch (ackError) {
+          // If ack fails, log but don't throw (message might be processed already)
+          logger.warn('Failed to acknowledge message', {
+            messageId: message.messageId,
+            error: ackError instanceof Error ? ackError.message : String(ackError),
+          });
         }
       } catch (error) {
         logger.error('Error processing message', {
@@ -151,6 +157,16 @@ export class ProcessorWorker {
           type: message.type,
           error: error instanceof Error ? error.message : String(error),
         });
+        // For RabbitMQ, nack the message (re-queue it for retry)
+        try {
+          await this.queue.nackMessage(message);
+        } catch (nackError) {
+          // If nack fails, log but don't throw (message will be retried by RabbitMQ)
+          logger.warn('Failed to nack message', {
+            messageId: message.messageId,
+            error: nackError instanceof Error ? nackError.message : String(nackError),
+          });
+        }
         // Don't acknowledge on error - let message be retried
       }
     }
@@ -187,6 +203,11 @@ export class ProcessorWorker {
       runId: event.runId,
       stepId: event.stepId,
     });
+
+    // Normalize timestamp (handle JSON deserialization)
+    if (typeof event.timestamp === 'string') {
+      event.timestamp = new Date(event.timestamp);
+    }
 
     // Store full payload in S3 (idempotent - deterministic key)
     const s3Key = await this.s3.storeDecisionEvent(event);
@@ -228,6 +249,14 @@ export class ProcessorWorker {
       status: run.status,
     });
 
+    // Normalize dates (handle JSON deserialization)
+    if (typeof run.startedAt === 'string') {
+      run.startedAt = new Date(run.startedAt);
+    }
+    if (run.completedAt && typeof run.completedAt === 'string') {
+      run.completedAt = new Date(run.completedAt);
+    }
+
     // Store full payload in S3
     const s3Key = await this.s3.storeRun(run);
     logger.debug('Run stored in S3', { runId: run.id, s3Key });
@@ -250,6 +279,14 @@ export class ProcessorWorker {
       type: step.type,
       name: step.name,
     });
+
+    // Normalize dates (handle JSON deserialization)
+    if (typeof step.startedAt === 'string') {
+      step.startedAt = new Date(step.startedAt);
+    }
+    if (step.completedAt && typeof step.completedAt === 'string') {
+      step.completedAt = new Date(step.completedAt);
+    }
 
     // Store full payload in S3
     // Need runId - try to get from cache or metadata
@@ -276,11 +313,27 @@ export class ProcessorWorker {
       return;
     }
 
-    const run = this.runCache.get((step as any).runId || '');
+    const runId = (step as any).runId;
+    if (!runId) {
+      logger.warn('Step missing runId', { stepId });
+      return;
+    }
+
+    // Wait a bit for run to be processed (race condition: step might arrive before run)
+    let run = this.runCache.get(runId);
     if (!run) {
-      logger.warn('Run not found in cache', {
+      // Wait up to 5 seconds for run to appear
+      for (let i = 0; i < 10; i++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        run = this.runCache.get(runId);
+        if (run) break;
+      }
+    }
+
+    if (!run) {
+      logger.warn('Run not found in cache after waiting', {
         stepId,
-        runId: (step as any).runId,
+        runId,
       });
       return;
     }

@@ -18,7 +18,7 @@ X-Ray tracks decisions made in multi-step pipelines. When a pipeline produces wr
                                                 │
                                                 ▼
                                          ┌──────────────┐
-                                         │  MinIO (S3)  │
+                                         │   AWS S3     │
                                          │ (Raw Events) │
                                          └──────────────┘
 ```

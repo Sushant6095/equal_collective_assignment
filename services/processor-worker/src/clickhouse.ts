@@ -46,11 +46,7 @@ export interface RunMetrics {
 }
 
 /**
- * ClickHouse client for analytics storage
- * 
- * Trade-off: We store aggregated metrics, not raw events. This enables fast
- * analytics queries but requires aggregation logic. Raw events in S3 provide
- * full traceability when needed.
+ * ClickHouse client - stores aggregated metrics, not raw events. Raw events go to S3.
  */
 export class ClickHouseStorage {
   private client: ClickHouseClient;
@@ -61,13 +57,16 @@ export class ClickHouseStorage {
     
     // Build connection config - completely omit password if empty
     // ClickHouse client has issues with empty string passwords
+    // Aiven ClickHouse uses HTTPS (ports > 20000 or 443/8443)
+    const protocol = config.port === 443 || config.port === 8443 || config.port > 20000 ? 'https' : 'http';
+    
     const clientConfig: {
       host: string;
       username: string;
       database: string;
       password?: string;
     } = {
-      host: `http://${config.host}:${config.port}`,
+      host: `${protocol}://${config.host}:${config.port}`,
       username: config.user,
       database: this.database,
     };
@@ -170,9 +169,9 @@ export class ClickHouseStorage {
           run_id: metrics.runId,
           pipeline_id: metrics.pipelineId,
           status: metrics.status,
-          started_at: metrics.startedAt.toISOString().replace('T', ' ').replace('Z', ''),
+          started_at: (metrics.startedAt instanceof Date ? metrics.startedAt : new Date(metrics.startedAt)).toISOString().replace('T', ' ').replace('Z', ''),
           completed_at: metrics.completedAt
-            ? metrics.completedAt.toISOString().replace('T', ' ').replace('Z', '')
+            ? (metrics.completedAt instanceof Date ? metrics.completedAt : new Date(metrics.completedAt)).toISOString().replace('T', ' ').replace('Z', '')
             : null,
           error: metrics.error,
           total_steps: metrics.totalSteps,
@@ -208,9 +207,9 @@ export class ClickHouseStorage {
           kept_count: metrics.keptCount,
           eliminated_count: metrics.eliminatedCount,
           scored_count: metrics.scoredCount,
-          started_at: metrics.startedAt.toISOString().replace('T', ' ').replace('Z', ''),
+          started_at: (metrics.startedAt instanceof Date ? metrics.startedAt : new Date(metrics.startedAt)).toISOString().replace('T', ' ').replace('Z', ''),
           completed_at: metrics.completedAt
-            ? metrics.completedAt.toISOString().replace('T', ' ').replace('Z', '')
+            ? (metrics.completedAt instanceof Date ? metrics.completedAt : new Date(metrics.completedAt)).toISOString().replace('T', ' ').replace('Z', '')
             : null,
           updated_at: new Date().toISOString().replace('T', ' ').replace('Z', ''),
         },
@@ -240,7 +239,7 @@ export class ClickHouseStorage {
           outcome: event.outcome,
           item_id: event.itemId,
           score: event.score ?? null,
-          timestamp: event.timestamp.toISOString().replace('T', ' ').replace('Z', ''),
+          timestamp: (event.timestamp instanceof Date ? event.timestamp : new Date(event.timestamp)).toISOString().replace('T', ' ').replace('Z', ''),
           s3_key: s3Key,
           updated_at: new Date().toISOString().replace('T', ' ').replace('Z', ''),
         },
@@ -259,11 +258,34 @@ export class ClickHouseStorage {
     run: XRRun,
     decisionEvents: XRDecisionEvent[]
   ): StepMetrics {
-    const inputCount = decisionEvents.length > 0
-      ? (decisionEvents[0].metadata?.inputCount as number) || decisionEvents.length
-      : 0;
+    // Try to get input/output counts from step config first (most reliable)
+    let inputCount = 0;
+    let outputCount = 0;
+    
+    if (step.config && typeof step.config === 'object') {
+      const config = step.config as any;
+      inputCount = config.inputCount || config.input_count || 0;
+      outputCount = config.outputCount || config.output_count || 0;
+    }
+    
+    // If not in config, try to get from decision events metadata
+    if (inputCount === 0 && decisionEvents.length > 0) {
+      inputCount = (decisionEvents[0].metadata?.inputCount as number) || 
+                   (decisionEvents[0].metadata?.input_count as number) || 0;
+    }
+    
+    // If still 0, estimate from decision events (but this is not accurate)
+    // For accurate metrics, step config should include inputCount
+    if (inputCount === 0 && decisionEvents.length > 0) {
+      // Estimate: if we have decision events, input is at least that many
+      // But we don't know the actual input count, so we'll use a conservative estimate
+      inputCount = decisionEvents.length;
+    }
+    
+    // If outputCount not in config, calculate from decision events
+    if (outputCount === 0) {
 
-    const outputCount = decisionEvents.length;
+    // Calculate counts from decision events
     const keptCount = decisionEvents.filter(
       (e) => e.outcome === XRDecisionOutcome.KEPT
     ).length;
@@ -273,6 +295,12 @@ export class ClickHouseStorage {
     const scoredCount = decisionEvents.filter(
       (e) => e.outcome === XRDecisionOutcome.SCORED
     ).length;
+    
+    // If outputCount not in config, calculate from decision events
+    // Output count = kept + scored (items that passed through)
+    if (outputCount === 0) {
+      outputCount = keptCount + scoredCount;
+    }
 
     const eliminationRatio =
       inputCount > 0 ? 1 - outputCount / inputCount : 0;
@@ -289,8 +317,8 @@ export class ClickHouseStorage {
       keptCount,
       eliminatedCount,
       scoredCount,
-      startedAt: step.startedAt,
-      completedAt: step.completedAt,
+      startedAt: step.startedAt instanceof Date ? step.startedAt : new Date(step.startedAt),
+      completedAt: step.completedAt ? (step.completedAt instanceof Date ? step.completedAt : new Date(step.completedAt)) : null,
     };
   }
 
@@ -311,8 +339,8 @@ export class ClickHouseStorage {
       runId: run.id,
       pipelineId: run.pipelineId,
       status: run.status,
-      startedAt: run.startedAt,
-      completedAt: run.completedAt,
+      startedAt: run.startedAt instanceof Date ? run.startedAt : new Date(run.startedAt),
+      completedAt: run.completedAt ? (run.completedAt instanceof Date ? run.completedAt : new Date(run.completedAt)) : null,
       error: run.error,
       totalSteps,
       totalInputCount,

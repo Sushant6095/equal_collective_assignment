@@ -1,223 +1,9 @@
 /**
  * ClickHouse query client
  * 
- * Design: Explicit SQL queries, no joins across large tables.
- * Each query is optimized for its specific use case.
- * 
- * ============================================================================
- * DATA MODEL RATIONALE
- * ============================================================================
- * 
- * Why Three Tables (runs, steps, decision_events)?
- * 
- * Each table serves a different query pattern optimized for ClickHouse:
- * 
- * 1. **runs table**: "Show me all pipeline executions from last week"
- *    - Query: SELECT * FROM runs WHERE started_at > '2024-01-01'
- *    - Fast: Single table scan, no joins, pre-aggregated metrics
- *    - Stores: run_id, pipeline_id, status, overall_elimination_ratio, etc.
- * 
- * 2. **steps table**: "Which step eliminated the most items?"
- *    - Query: SELECT step_name, elimination_ratio FROM steps WHERE run_id = 'x'
- *    - Fast: Filter by run_id (denormalized), no join needed
- *    - Stores: step_id, run_id, input_count, output_count, elimination_ratio
- * 
- * 3. **decision_events table**: "Why was item X eliminated at step Y?"
- *    - Query: SELECT * FROM decision_events WHERE item_id = 'phone-case-123'
- *    - Fast: Indexed by (run_id, step_id, timestamp), links to S3 for full payload
- *    - Stores: event_id, item_id, outcome, s3_key (not full payload)
- * 
- * Alternatives Considered:
- * 
- * 1. **Single Table with JSON**: Store everything in one table with nested JSON
- *    - Problem: ClickHouse JSON queries are slow, can't index nested fields
- *    - Would break: Fast filtering by run_id, step_id, item_id
- *    - Would break: Efficient aggregation queries (elimination ratios)
- * 
- * 2. **Normalized Schema with Joins**: Separate tables, join on foreign keys
- *    - Problem: ClickHouse joins are expensive, especially across large tables
- *    - Would break: Query performance - joins require shuffling data across nodes
- *    - Would break: Query simplicity - every query needs complex JOIN syntax
- * 
- * 3. **Store Full Payloads in ClickHouse**: Put entire decision event JSON in ClickHouse
- *    - Problem: ClickHouse storage is expensive for large JSON blobs
- *    - Would break: Cost efficiency - storing millions of full payloads is costly
- *    - Would break: Query performance - scanning large JSON columns is slow
- * 
- * 4. **Only S3 Storage**: Store everything in S3, no ClickHouse
- *    - Problem: S3 queries are slow, no indexing, no aggregation
- *    - Would break: Dashboard performance - can't quickly show "runs with high elimination"
- *    - Would break: Analytics - can't aggregate metrics across runs/steps
- * 
- * Current Design Trade-offs:
- * 
- * ✅ **Dual Storage (ClickHouse + S3)**:
- *    - ClickHouse: Fast queries on aggregated metrics and references
- *    - S3: Cheap storage for full payloads, fetched only when debugging
- *    - Trade-off: Two storage systems to maintain, but enables both fast queries and cost efficiency
- * 
- * ✅ **Denormalized IDs**:
- *    - run_id and step_id stored in both steps and decision_events tables
- *    - Trade-off: Data duplication, but enables queries without joins
- *    - Benefit: Each query hits one table, uses primary key/index efficiently
- * 
- * ✅ **ReplacingMergeTree Engine**:
- *    - Handles duplicate inserts (idempotent processing)
- *    - Trade-off: Must use FINAL keyword for immediate consistency (slower) or accept eventual consistency
- *    - Benefit: Safe retries, no need for complex upsert logic
- * 
- * ============================================================================
- * DEBUGGING WALKTHROUGH: Phone Case Matched to Laptop Stand
- * ============================================================================
- * 
- * Scenario: A competitor selection run returns a bad match - a phone case was
- * incorrectly matched against a laptop stand. Using X-Ray, here's how to debug:
- * 
- * Step 1: Identify the Problematic Run
- * 
- * Query: SELECT * FROM runs WHERE overall_elimination_ratio > 0.8 ORDER BY started_at DESC
- * 
- * What you see:
- * - run_id: "run-abc-123"
- * - pipeline_id: "competitor-selection"
- * - overall_elimination_ratio: 0.85 (85% eliminated - suspiciously high)
- * - status: "completed"
- * 
- * Step 2: Examine Steps in the Run
- * 
- * Query: SELECT * FROM steps WHERE run_id = 'run-abc-123' ORDER BY started_at ASC
- * 
- * What you see:
- * - Step 1: "generate-search-keywords" (LLM step) - input: 1, output: 7 keywords
- * - Step 2: "filter-by-keywords" (FILTER step) - input: 8, output: 2, elimination_ratio: 0.75
- * - Step 3: "filter-by-revenue" (FILTER step) - input: 2, output: 1, elimination_ratio: 0.50
- * - Step 4: "rank-by-relevance" (RANK step) - input: 1, output: 1, elimination_ratio: 0.00
- * 
- * Red flag: Step 2 has 75% elimination - this is where most items were filtered out.
- * 
- * Step 3: Inspect Decision Events for the Suspicious Step
- * 
- * Query: SELECT * FROM decision_events WHERE step_id = 'step-filter-keywords-456' 
- *        ORDER BY timestamp ASC
- * 
- * What you see (from ClickHouse):
- * - event_id: "evt-789", item_id: "phone-case-123", outcome: "kept", s3_key: "decisions/2024/01/15/evt-789.json"
- * - event_id: "evt-790", item_id: "laptop-stand-456", outcome: "kept", s3_key: "decisions/2024/01/15/evt-790.json"
- * - ... (other events with outcome: "eliminated")
- * 
- * Step 4: Fetch Full Payload from S3 to See Why Phone Case Was Kept
- * 
- * Fetch: GET s3://bucket/decisions/2024/01/15/evt-789.json
- * 
- * What you see in the raw payload:
- * {
- *   "itemId": "phone-case-123",
- *   "input": {
- *     "id": "phone-case-123",
- *     "name": "iPhone Case",
- *     "category": "phone-accessories",
- *     "keywords": ["phone", "case", "protection", "mobile"]
- *   },
- *   "outcome": "kept",
- *   "reason": "Matches all required keywords: phone, case, protection, mobile"
- * }
- * 
- * Step 5: Check What Keywords Were Generated (LLM Step)
- * 
- * Query: SELECT * FROM decision_events WHERE step_id = 'step-generate-keywords-123'
- * 
- * Fetch S3 payloads for keyword generation events to see:
- * - Generated keywords: ["laptop", "stand", "desk", "ergonomic", "adjustable"]
- * 
- * Step 6: Root Cause Identified
- * 
- * The problem: The keyword filter step incorrectly kept "phone-case-123" even though
- * the generated keywords were for "laptop stand". Looking at the decision event reason:
- * 
- * "Matches all required keywords: phone, case, protection, mobile"
- * 
- * But the required keywords were: ["laptop", "stand", "desk", "ergonomic", "adjustable"]
- * 
- * This reveals a bug: The filter logic is matching keywords incorrectly - possibly
- * doing substring matching instead of exact matching, or the keyword matching logic
- * has a flaw that allows "phone" to match "laptop" (maybe fuzzy matching gone wrong).
- * 
- * Step 7: Track the Item Through All Steps
- * 
- * Query: SELECT * FROM decision_events WHERE run_id = 'run-abc-123' 
- *        AND item_id = 'phone-case-123' ORDER BY timestamp ASC
- * 
- * What you see:
- * - Step 1 (generate-keywords): Not applicable (no item_id for LLM steps)
- * - Step 2 (filter-by-keywords): outcome: "kept", reason: "Matches all keywords"
- * - Step 3 (filter-by-revenue): outcome: "kept", reason: "Revenue meets threshold"
- * - Step 4 (rank-by-relevance): outcome: "scored", score: 0.65, reason: "Relevance score: 0.65"
- * 
- * This shows the phone case incorrectly passed through all filters and was ranked,
- * ending up as the final match when it should have been eliminated at step 2.
- * 
- * ============================================================================
- * QUERYABILITY: How Queries Work Without Joins
- * ============================================================================
- * 
- * The design prioritizes query performance by avoiding joins across large tables.
- * Instead, we denormalize foreign keys (run_id, step_id) into each table and
- * query each table independently.
- * 
- * Example Query Patterns:
- * 
- * 1. "Get all runs with high elimination ratio"
- *    Query: SELECT * FROM runs WHERE overall_elimination_ratio > 0.8
- *    Why it's fast: Single table scan, indexed by run_id, pre-aggregated metric
- *    No join needed: All data is in runs table
- * 
- * 2. "Get all steps for a run"
- *    Query: SELECT * FROM steps WHERE run_id = 'run-123' ORDER BY started_at
- *    Why it's fast: Filter by run_id (denormalized), no join with runs table
- *    No join needed: run_id is stored in steps table
- * 
- * 3. "Get all decision events for a step"
- *    Query: SELECT * FROM decision_events WHERE step_id = 'step-456' ORDER BY timestamp
- *    Why it's fast: Filter by step_id (denormalized), indexed by (run_id, step_id, timestamp)
- *    No join needed: step_id is stored in decision_events table
- * 
- * 4. "Track an item through all steps in a run"
- *    Query: SELECT * FROM decision_events WHERE run_id = 'run-123' 
- *           AND item_id = 'phone-case-123' ORDER BY timestamp
- *    Why it's fast: Filter by run_id + item_id, both denormalized in the table
- *    No join needed: All decision events for the item are in one table
- * 
- * 5. "Get step details with decision events"
- *    Application-level: Two separate queries, combine in application code
- *    - Query 1: SELECT * FROM steps WHERE step_id = 'step-456'
- *    - Query 2: SELECT * FROM decision_events WHERE step_id = 'step-456'
- *    Why it's fast: Each query hits one table, uses primary key/index
- *    Trade-off: Two queries instead of one join, but each is optimized
- * 
- * Why No Joins?
- * 
- * ClickHouse is columnar and optimized for single-table scans. Joins require:
- * - Shuffling data across nodes (in distributed setup)
- * - Building hash tables in memory
- * - Multiple table scans
- * 
- * Our denormalized design:
- * - Each query scans one table
- * - Uses primary key/index efficiently
- * - Predictable performance (no join planning)
- * - Scales linearly with table size
- * 
- * Trade-offs:
- * - Data duplication: run_id and step_id stored in multiple tables
- * - Storage cost: Slightly higher storage due to denormalization
- * - Consistency: Must update multiple tables when run/step metadata changes
- *    (mitigated by ReplacingMergeTree - idempotent inserts handle duplicates)
- * 
- * Benefits:
- * - Query performance: Each query is fast and predictable
- * - Simplicity: No complex JOIN syntax, easy to understand
- * - Scalability: Performance doesn't degrade with joins across large tables
- * - Flexibility: Can query any table independently without dependencies
+ * Three tables: runs (pipeline executions), steps (step metrics), decision_events (item decisions).
+ * We denormalize run_id/step_id into each table to avoid joins - ClickHouse is much faster with single-table queries.
+ * Full payloads go to S3, ClickHouse just stores references and metrics.
  */
 
 import { createClient, ClickHouseClient } from '@clickhouse/client';
@@ -273,10 +59,7 @@ export interface DecisionEventRow {
 }
 
 /**
- * ClickHouse query client
- * 
- * Trade-off: Explicit SQL queries for clarity and control.
- * No ORM abstraction - direct SQL for performance and transparency.
+ * ClickHouse query client - direct SQL, no ORM
  */
 export class ClickHouseQuery {
   private client: ClickHouseClient;
@@ -285,21 +68,22 @@ export class ClickHouseQuery {
   constructor(config: ClickHouseConfig) {
     this.database = config.database;
     
-    // Build connection config - completely omit password if empty
-    // ClickHouse client has issues with empty string passwords
+    // Omit password if empty - ClickHouse client doesn't like empty strings
+    // Aiven ClickHouse uses HTTPS (ports > 20000 or 443/8443)
+    const protocol = config.port === 443 || config.port === 8443 || config.port > 20000 ? 'https' : 'http';
+    
     const clientConfig: {
       host: string;
       username: string;
       database: string;
       password?: string;
     } = {
-      host: `http://${config.host}:${config.port}`,
+      host: `${protocol}://${config.host}:${config.port}`,
       username: config.user,
       database: this.database,
     };
     
-    // Only add password property if it's actually provided and not empty
-    // Omitting the field entirely works better than empty string
+    // Only add password if it's actually set
     const password = config.password?.trim();
     if (password && password.length > 0) {
       clientConfig.password = password;
@@ -309,15 +93,7 @@ export class ClickHouseQuery {
   }
 
   /**
-   * Query runs with optional filter for "bad" runs
-   * 
-   * Bad filter criteria:
-   * - High elimination ratio (> 0.8)
-   * - Failed status
-   * - Has error
-   * 
-   * Trade-off: Single query with WHERE clause. No joins needed
-   * since all data is in the runs table.
+   * Get runs, optionally filtered for bad ones (high elimination ratio, failed, or errors)
    */
   async queryRuns(
     badFilter: boolean = false,
@@ -365,11 +141,10 @@ export class ClickHouseQuery {
       const rows = await result.json() as RunRow[];
       return rows;
     } catch (error: any) {
-      // If table doesn't exist or query fails, return empty array
-      // This allows dashboard to load even if no data exists yet
+      // Return empty array if table doesn't exist yet (dashboard can still load)
       const errorMessage = error?.message || String(error);
       if (errorMessage.includes('doesn\'t exist') || errorMessage.includes('Table') && errorMessage.includes('not found')) {
-        // Table doesn't exist yet - processor worker hasn't initialized
+        // Table doesn't exist yet
         return [];
       }
       console.error('Error querying runs:', errorMessage);
@@ -378,10 +153,7 @@ export class ClickHouseQuery {
   }
 
   /**
-   * Get a specific run by ID
-   * 
-   * Trade-off: Direct lookup by primary key (run_id).
-   * FINAL ensures we get the latest version from ReplacingMergeTree.
+   * Get a run by ID. FINAL ensures we get the latest version from ReplacingMergeTree.
    */
   async getRunById(runId: string): Promise<RunRow | null> {
     try {
@@ -418,10 +190,7 @@ export class ClickHouseQuery {
   }
 
   /**
-   * Get steps for a run
-   * 
-   * Trade-off: Query steps table directly, no join with runs.
-   * Run ID is already in steps table, so no join needed.
+   * Get all steps for a run. No join needed - run_id is in the steps table.
    */
   async getStepsByRunId(runId: string): Promise<StepRow[]> {
     try {
@@ -460,9 +229,7 @@ export class ClickHouseQuery {
   }
 
   /**
-   * Get a specific step by ID
-   * 
-   * Trade-off: Direct lookup, no joins.
+   * Get a step by ID
    */
   async getStepById(stepId: string): Promise<StepRow | null> {
     try {
@@ -500,11 +267,7 @@ export class ClickHouseQuery {
   }
 
   /**
-   * Get decision events for a step
-   * 
-   * Trade-off: Query decision_events table directly.
-   * No join with steps table - step_id is sufficient.
-   * Returns references with S3 keys, not full payloads.
+   * Get decision events for a step. Returns S3 keys, not full payloads.
    */
   async getDecisionEventsByStepId(
     stepId: string,
@@ -542,21 +305,8 @@ export class ClickHouseQuery {
   }
 
   /**
-   * Get all decision events for a specific item across all steps in a run
-   * 
-   * Use case: Track a specific product/item through the entire pipeline to debug
-   * why it was kept, eliminated, or scored at each step.
-   * 
-   * Example: Debug why "phone-case-123" was incorrectly matched to "laptop-stand-456"
-   * - Query all decision events for item_id = "phone-case-123" in run_id = "run-abc-123"
-   * - See the decision at each step: kept at filter step, scored at rank step, etc.
-   * - Fetch full payloads from S3 (using s3_key) to see input/output/reason for each decision
-   * 
-   * Trade-off: Single table query, no joins. item_id and run_id are denormalized
-   * in decision_events table, so we can query directly without joining to steps/runs.
-   * 
-   * Queryability: This demonstrates how the denormalized design enables tracking
-   * an item's journey through the pipeline with a single efficient query.
+   * Track an item through all steps in a run. Useful for debugging why something
+   * was kept/eliminated. Returns S3 keys to fetch full payloads if needed.
    */
   async getDecisionEventsByItemId(
     runId: string,

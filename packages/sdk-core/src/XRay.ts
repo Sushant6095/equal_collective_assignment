@@ -1,12 +1,7 @@
 /**
- * X-Ray SDK - Main entry point for decision observability
+ * X-Ray SDK - tracks decisions in pipelines
  * 
- * Design trade-offs:
- * - Non-blocking: All operations are fire-and-forget to never block application logic
- * - Automatic metrics: Captures input/output counts without requiring explicit calls
- * - Adaptive sampling: Reduces data volume while maintaining observability
- * - Silent failures: SDK failures never affect application execution
- * - Lightweight wrapper: Works with existing code without requiring refactoring
+ * Non-blocking, automatic metrics, adaptive sampling. Never throws errors.
  */
 
 import { v4 as uuidv4 } from 'uuid';
@@ -33,8 +28,7 @@ export interface XRayConfig {
 }
 
 /**
- * Decision callback for custom decision reporting
- * Allows developers to optionally provide decision context
+ * Optional callback to provide custom decision context
  */
 export interface DecisionCallback<TInput, TOutput> {
   (item: TInput, result: TOutput, index: number): {
@@ -45,26 +39,7 @@ export interface DecisionCallback<TInput, TOutput> {
 }
 
 /**
- * X-Ray SDK for tracking decisions in multi-step pipelines
- * 
- * Usage (Lightweight - works with existing code):
- *   const xray = new XRay({ apiUrl: 'http://localhost:3000' });
- *   const runId = await xray.startRun('pipeline-1', input);
- *   
- *   // Simple wrapper - no code changes needed
- *   const result = await xray.step(
- *     runId,
- *     XRStepType.FILTER,
- *     'filter-step',
- *     async (input) => {
- *       // Your existing business logic - no changes needed!
- *       return input.filter(item => item.score > 0.5);
- *     },
- *     inputData,
- *     { threshold: 0.5 }
- *   );
- *   
- *   await xray.endRun(runId, result);
+ * X-Ray SDK - wrap your existing pipeline code, no refactoring needed
  */
 export class XRay {
   private activeRuns: Map<string, XRRun> = new Map();
@@ -79,9 +54,7 @@ export class XRay {
     this.sampler = new AdaptiveSampler();
     this.transport = new HttpTransport({ apiUrl: config.apiUrl });
 
-    // Initialize buffer with transport callback
-    // Trade-off: Buffer handles batching, transport handles HTTP.
-    // This separation allows us to swap transports (e.g., to file, queue) without changing buffer logic.
+    // Buffer batches events, transport sends them - can swap transports easily
     this.buffer = new EventBuffer(
       (events) => this.transport.sendDecisionEvents(events),
       config.bufferConfig
@@ -89,10 +62,7 @@ export class XRay {
   }
 
   /**
-   * Start a new pipeline run
-   * 
-   * Trade-off: We store runs in memory. For production, consider persisting
-   * to a database for durability and cross-process visibility.
+   * Start a new pipeline run. Stored in memory for now.
    */
   async startRun(
     pipelineId: string,

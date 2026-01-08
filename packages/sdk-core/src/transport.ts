@@ -1,12 +1,5 @@
 /**
- * HTTP transport for sending events to ingestion API
- * 
- * Design trade-offs:
- * - Silent failures: Never throw errors to calling code (SDK must never block)
- * - Retry logic: Simple exponential backoff for transient failures
- * - Batch sending: Reduces HTTP overhead
- * - Timeout: Prevents hanging requests
- * - Circuit breaker pattern: Could be added for production to avoid hammering down APIs
+ * HTTP transport - sends events to ingestion API. Never throws errors.
  */
 
 import { XRDecisionEvent, XRRun, XRStep } from '@xray/shared-types';
@@ -26,11 +19,7 @@ const DEFAULT_CONFIG: TransportConfig = {
 };
 
 /**
- * HTTP transport that sends events to the ingestion API
- * 
- * Trade-off: We use fetch API (Node 18+) for simplicity. For production,
- * consider using a more robust HTTP client (e.g., axios, got) with better
- * connection pooling and retry logic.
+ * HTTP transport using fetch API. Simple for now.
  */
 export class HttpTransport {
   private config: TransportConfig;
@@ -40,11 +29,7 @@ export class HttpTransport {
   }
 
   /**
-   * Send a batch of decision events
-   * 
-   * Trade-off: We catch all errors and return void. This ensures the SDK
-   * never throws, but means errors are silently swallowed. In production,
-   * consider adding an error callback or event emitter for monitoring.
+   * Send decision events. Swallows all errors - never throws.
    */
   async sendDecisionEvents(events: XRDecisionEvent[]): Promise<void> {
     if (events.length === 0) {
@@ -58,9 +43,7 @@ export class HttpTransport {
         data: events,
       });
     } catch (error) {
-      // Silent failure - SDK must never block application logic
-      // Trade-off: We lose observability of SDK failures, but maintain
-      // application stability. Consider logging to a separate error tracking system.
+      // Silent failure - never block the app
     }
   }
 
@@ -143,9 +126,7 @@ export class HttpTransport {
           throw lastError;
         }
 
-        // Exponential backoff: wait before retry
-        // Trade-off: Fixed exponential backoff. Consider adding jitter
-        // to prevent synchronized retries from multiple clients.
+        // Exponential backoff before retry
         const delay = this.config.retryDelayMs * Math.pow(2, attempt);
         await this.sleep(delay);
       }
