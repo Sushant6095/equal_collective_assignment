@@ -1,43 +1,50 @@
 /**
- * S3/MinIO client for fetching raw payloads
+ * AWS S3 client for fetching raw payloads
  * 
  * Design: Fetch raw payloads from S3 only when needed.
  * ClickHouse stores S3 keys, we use those to fetch full payloads.
  */
 
-import * as MinIO from 'minio';
+import { S3Client as AWSS3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { XRDecisionEvent, XRRun, XRStep } from '@xray/shared-types';
 
 export interface S3Config {
-  endpoint: string;
-  port: number;
-  accessKey: string;
-  secretKey: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
   bucket: string;
-  useSSL: boolean;
-  region?: string; // For AWS S3, GCS, etc.
+  endpoint?: string; // Optional: for S3-compatible services
 }
 
 /**
- * S3 client for fetching raw payloads
+ * AWS S3 client for fetching raw payloads
  * 
- * Trade-off: Lazy loading - only fetch from S3 when explicitly requested.
+ * Lazy loading - only fetch from S3 when explicitly requested.
  * This keeps API responses fast by default, with option to fetch full payloads.
  */
 export class S3Client {
-  private client: MinIO.Client;
+  private client: AWSS3Client;
   private bucketName: string;
 
   constructor(config: S3Config) {
     this.bucketName = config.bucket;
-    this.client = new MinIO.Client({
-      endPoint: config.endpoint,
-      port: config.port,
-      useSSL: config.useSSL,
-      accessKey: config.accessKey,
-      secretKey: config.secretKey,
-      region: config.region, // For AWS S3 and other cloud providers
-    });
+    
+    // Create S3 client
+    const clientConfig: any = {
+      region: config.region,
+      credentials: {
+        accessKeyId: config.accessKeyId,
+        secretAccessKey: config.secretAccessKey,
+      },
+    };
+
+    // Add endpoint if provided (for S3-compatible services)
+    if (config.endpoint) {
+      clientConfig.endpoint = config.endpoint;
+      clientConfig.forcePathStyle = true;
+    }
+
+    this.client = new AWSS3Client(clientConfig);
   }
 
   /**
@@ -48,23 +55,27 @@ export class S3Client {
    */
   async getDecisionEvent(s3Key: string): Promise<XRDecisionEvent | null> {
     try {
-      const dataStream = await this.client.getObject(this.bucketName, s3Key);
-      const chunks: Buffer[] = [];
+      const response = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucketName,
+          Key: s3Key,
+        })
+      );
 
-      return new Promise((resolve, reject) => {
-        dataStream.on('data', (chunk) => chunks.push(chunk));
-        dataStream.on('end', () => {
-          try {
-            const payload = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            resolve(payload as XRDecisionEvent);
-          } catch (error) {
-            reject(error);
-          }
-        });
-        dataStream.on('error', reject);
-      });
+      if (!response.Body) {
+        return null;
+      }
+
+      // Convert stream to string
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of response.Body as any) {
+        chunks.push(chunk);
+      }
+      const buffer = Buffer.concat(chunks);
+      const payload = JSON.parse(buffer.toString('utf-8'));
+      return payload as XRDecisionEvent;
     } catch (error: any) {
-      if (error.code === 'NoSuchKey' || error.code === 'NotFound') {
+      if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
         return null;
       }
       throw error;
@@ -76,23 +87,26 @@ export class S3Client {
    */
   async getRun(s3Key: string): Promise<XRRun | null> {
     try {
-      const dataStream = await this.client.getObject(this.bucketName, s3Key);
-      const chunks: Buffer[] = [];
+      const response = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucketName,
+          Key: s3Key,
+        })
+      );
 
-      return new Promise((resolve, reject) => {
-        dataStream.on('data', (chunk) => chunks.push(chunk));
-        dataStream.on('end', () => {
-          try {
-            const payload = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            resolve(payload as XRRun);
-          } catch (error) {
-            reject(error);
-          }
-        });
-        dataStream.on('error', reject);
-      });
+      if (!response.Body) {
+        return null;
+      }
+
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of response.Body as any) {
+        chunks.push(chunk);
+      }
+      const buffer = Buffer.concat(chunks);
+      const payload = JSON.parse(buffer.toString('utf-8'));
+      return payload as XRRun;
     } catch (error: any) {
-      if (error.code === 'NoSuchKey' || error.code === 'NotFound') {
+      if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
         return null;
       }
       throw error;
@@ -104,23 +118,26 @@ export class S3Client {
    */
   async getStep(s3Key: string): Promise<XRStep | null> {
     try {
-      const dataStream = await this.client.getObject(this.bucketName, s3Key);
-      const chunks: Buffer[] = [];
+      const response = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucketName,
+          Key: s3Key,
+        })
+      );
 
-      return new Promise((resolve, reject) => {
-        dataStream.on('data', (chunk) => chunks.push(chunk));
-        dataStream.on('end', () => {
-          try {
-            const payload = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            resolve(payload as XRStep);
-          } catch (error) {
-            reject(error);
-          }
-        });
-        dataStream.on('error', reject);
-      });
+      if (!response.Body) {
+        return null;
+      }
+
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of response.Body as any) {
+        chunks.push(chunk);
+      }
+      const buffer = Buffer.concat(chunks);
+      const payload = JSON.parse(buffer.toString('utf-8'));
+      return payload as XRStep;
     } catch (error: any) {
-      if (error.code === 'NoSuchKey' || error.code === 'NotFound') {
+      if (error.name === 'NoSuchKey' || error.$metadata?.httpStatusCode === 404) {
         return null;
       }
       throw error;

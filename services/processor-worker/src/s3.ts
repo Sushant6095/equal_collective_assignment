@@ -1,60 +1,66 @@
 /**
- * S3/MinIO client for storing full raw payloads
+ * AWS S3 client for storing raw payloads
  * 
- * Design: Stores complete decision event payloads with deterministic keys
- * for idempotent processing. Keys are based on event ID to ensure
- * same event always maps to same S3 key.
+ * Uses deterministic keys based on event ID so retries are safe.
  */
 
-import * as MinIO from 'minio';
+import { S3Client, PutObjectCommand, HeadObjectCommand, CreateBucketCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
 import { XRDecisionEvent, XRRun, XRStep } from '@xray/shared-types';
 
 export interface S3Config {
-  endpoint: string;
-  port: number;
-  accessKey: string;
-  secretKey: string;
+  region: string;
+  accessKeyId: string;
+  secretAccessKey: string;
   bucket: string;
-  useSSL: boolean;
-  region?: string; // For AWS S3, GCS, etc.
+  endpoint?: string; // Optional: for S3-compatible services
 }
 
 /**
- * S3/MinIO storage for raw payloads
- * 
- * Trade-off: Deterministic keys based on event ID ensure idempotency.
- * Same event ID always maps to same S3 key, so retries are safe.
- * 
- * Key format: {type}/{year}/{month}/{day}/{id}.json
- * Example: decisions/2024/01/15/event-123.json
+ * AWS S3 storage for raw payloads. Key format: {type}/{year}/{month}/{day}/{id}.json
  */
 export class S3Storage {
-  private client: MinIO.Client;
+  private client: S3Client;
   private bucketName: string;
 
   constructor(config: S3Config) {
     this.bucketName = config.bucket;
-    this.client = new MinIO.Client({
-      endPoint: config.endpoint,
-      port: config.port,
-      useSSL: config.useSSL,
-      accessKey: config.accessKey,
-      secretKey: config.secretKey,
-      region: config.region, // For AWS S3 and other cloud providers
-    });
+    
+    // Create S3 client
+    const clientConfig: any = {
+      region: config.region,
+      credentials: {
+        accessKeyId: config.accessKeyId,
+        secretAccessKey: config.secretAccessKey,
+      },
+    };
+
+    // Add endpoint if provided (for S3-compatible services)
+    if (config.endpoint) {
+      clientConfig.endpoint = config.endpoint;
+      clientConfig.forcePathStyle = true; // Required for S3-compatible services
+    }
+
+    this.client = new S3Client(clientConfig);
   }
 
   /**
-   * Initialize bucket if it doesn't exist
-   * 
-   * Idempotent: Safe to call multiple times.
+   * Create bucket if it doesn't exist. Safe to call multiple times.
    */
   async initialize(): Promise<void> {
-    const exists = await this.client.bucketExists(this.bucketName);
-    if (!exists) {
-      // Use provided region or default to us-east-1
-      const region = (this.client as any).region || 'us-east-1';
-      await this.client.makeBucket(this.bucketName, region);
+    try {
+      // Check if bucket exists
+      await this.client.send(new HeadBucketCommand({ Bucket: this.bucketName }));
+    } catch (error: any) {
+      // Bucket doesn't exist, create it
+      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
+        await this.client.send(
+          new CreateBucketCommand({
+            Bucket: this.bucketName,
+          })
+        );
+      } else {
+        throw error;
+      }
     }
   }
 
@@ -67,7 +73,8 @@ export class S3Storage {
    * Event ID ensures uniqueness and idempotency.
    */
   private getDecisionEventKey(event: XRDecisionEvent): string {
-    const date = event.timestamp;
+    // Handle both Date objects and ISO strings (from JSON deserialization)
+    const date = event.timestamp instanceof Date ? event.timestamp : new Date(event.timestamp);
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
@@ -78,7 +85,8 @@ export class S3Storage {
    * Generate deterministic S3 key for a run
    */
   private getRunKey(run: XRRun): string {
-    const date = run.startedAt;
+    // Handle both Date objects and ISO strings (from JSON deserialization)
+    const date = run.startedAt instanceof Date ? run.startedAt : new Date(run.startedAt);
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
@@ -89,7 +97,8 @@ export class S3Storage {
    * Generate deterministic S3 key for a step
    */
   private getStepKey(step: XRStep, runId: string): string {
-    const date = step.startedAt;
+    // Handle both Date objects and ISO strings (from JSON deserialization)
+    const date = step.startedAt instanceof Date ? step.startedAt : new Date(step.startedAt);
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
@@ -99,7 +108,7 @@ export class S3Storage {
   /**
    * Store decision event payload
    * 
-   * Idempotent: If object already exists, this is a no-op (or overwrites with same data).
+   * Idempotent: If object already exists, overwrites with same data.
    * Deterministic key ensures same event always goes to same location.
    */
   async storeDecisionEvent(event: XRDecisionEvent): Promise<string> {
@@ -108,29 +117,28 @@ export class S3Storage {
     const buffer = Buffer.from(payload, 'utf-8');
 
     // Check if object exists (idempotency check)
-    // Trade-off: We could skip the check and just overwrite, but checking
-    // allows us to log when we're processing duplicates.
     try {
-      await this.client.statObject(this.bucketName, key);
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucketName, Key: key }));
       // Object exists - this is a retry, which is fine
     } catch (error: any) {
       // Object doesn't exist or error - proceed with upload
-      if (error.code !== 'NotFound') {
+      if (error.name !== 'NotFound' && error.$metadata?.httpStatusCode !== 404) {
         throw error;
       }
     }
 
-    await this.client.putObject(
-      this.bucketName,
-      key,
-      buffer,
-      buffer.length,
-      {
-        'Content-Type': 'application/json',
-        'X-Event-Id': event.id,
-        'X-Run-Id': event.runId,
-        'X-Step-Id': event.stepId,
-      }
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        Body: buffer,
+        ContentType: 'application/json',
+        Metadata: {
+          'event-id': event.id,
+          'run-id': event.runId,
+          'step-id': event.stepId,
+        },
+      })
     );
 
     return key;
@@ -145,23 +153,24 @@ export class S3Storage {
     const buffer = Buffer.from(payload, 'utf-8');
 
     try {
-      await this.client.statObject(this.bucketName, key);
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucketName, Key: key }));
     } catch (error: any) {
-      if (error.code !== 'NotFound') {
+      if (error.name !== 'NotFound' && error.$metadata?.httpStatusCode !== 404) {
         throw error;
       }
     }
 
-    await this.client.putObject(
-      this.bucketName,
-      key,
-      buffer,
-      buffer.length,
-      {
-        'Content-Type': 'application/json',
-        'X-Run-Id': run.id,
-        'X-Pipeline-Id': run.pipelineId,
-      }
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        Body: buffer,
+        ContentType: 'application/json',
+        Metadata: {
+          'run-id': run.id,
+          'pipeline-id': run.pipelineId,
+        },
+      })
     );
 
     return key;
@@ -176,23 +185,24 @@ export class S3Storage {
     const buffer = Buffer.from(payload, 'utf-8');
 
     try {
-      await this.client.statObject(this.bucketName, key);
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucketName, Key: key }));
     } catch (error: any) {
-      if (error.code !== 'NotFound') {
+      if (error.name !== 'NotFound' && error.$metadata?.httpStatusCode !== 404) {
         throw error;
       }
     }
 
-    await this.client.putObject(
-      this.bucketName,
-      key,
-      buffer,
-      buffer.length,
-      {
-        'Content-Type': 'application/json',
-        'X-Step-Id': step.id,
-        'X-Run-Id': runId,
-      }
+    await this.client.send(
+      new PutObjectCommand({
+        Bucket: this.bucketName,
+        Key: key,
+        Body: buffer,
+        ContentType: 'application/json',
+        Metadata: {
+          'step-id': step.id,
+          'run-id': runId,
+        },
+      })
     );
 
     return key;
@@ -201,18 +211,19 @@ export class S3Storage {
   /**
    * Check if a decision event already exists (idempotency check)
    */
-  async decisionEventExists(eventId: string, timestamp: Date): Promise<boolean> {
-    const date = timestamp;
+  async decisionEventExists(eventId: string, timestamp: Date | string): Promise<boolean> {
+    // Handle both Date objects and ISO strings
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
     const year = date.getFullYear();
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     const key = `decisions/${year}/${month}/${day}/${eventId}.json`;
 
     try {
-      await this.client.statObject(this.bucketName, key);
+      await this.client.send(new HeadObjectCommand({ Bucket: this.bucketName, Key: key }));
       return true;
     } catch (error: any) {
-      if (error.code === 'NotFound') {
+      if (error.name === 'NotFound' || error.$metadata?.httpStatusCode === 404) {
         return false;
       }
       throw error;
