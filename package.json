@@ -16,7 +16,9 @@
     "build:apps": "npm run build --workspaces --if-present --workspace=apps/*",
     "clean": "npm run clean --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present"
+    "test": "npm run test --workspaces --if-present",
+    "verify": "node verify-connections.js",
+    "test:data-flow": "node test-data-flow.js"
   },
   "engines": {
     "node": ">=18.0.0",
@@ -24,5 +26,11 @@
   },
   "devDependencies": {
     "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.490.0",
+    "@clickhouse/client": "^0.2.7",
+    "amqplib": "^0.10.3",
+    "dotenv": "^17.2.3"
   }
 }
